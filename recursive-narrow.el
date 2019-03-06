@@ -57,6 +57,18 @@ return non-nil if applicable."
   :type 'hook
   :group 'recursive-narrow)
 
+;; Functions that need to be advised.
+(setq-default recursive-narrow-funcs-to-advise
+              '(org-narrow-to-subtree
+                org-narrow-to-block
+                org-narrow-to-element
+                narrow-to-defun
+                narrow-to-region
+                bibtex-narrow-to-entry
+                LaTeX-narrow-to-environment
+                TeX-narrow-to-group
+                sp-narrow-to-sexp))
+
 (defvar-local recursive-narrow-settings nil "List of buffer visibility settings.")
 
 (defmacro recursive-narrow-save-position (body &optional unchanged)
@@ -70,53 +82,69 @@ Executes UNCHANGED if the buffer visibility has not changed."
        ;; We narrowed, so save the information
        (push previous-settings recursive-narrow-settings))))
 
+(defun recursive-narrow-wrapper (func &rest alist)
+  "Wrapper function to advise other func calls to narrow-to-region.
+Perform exactly the same task, but push the current narrowing to
+`recursive-narrow-settings'"
+  (if (boundp 'recursive-narrow-previous-settings)
+      (apply func alist)
+    (let ((recursive-narrow-previous-settings (cons (point-min) (point-max))))
+      (apply func alist)
+      (unless (and (= (point-min) (car recursive-narrow-previous-settings))
+                   (= (point-max) (cdr recursive-narrow-previous-settings)))
+        (push recursive-narrow-previous-settings
+              recursive-narrow-settings)))))
+
+(advice-add #'narrow-to-defun :around #'recursive-narrow-wrapper)
+
+
 (defun recursive-narrow-or-widen-dwim ()
   "If the region is active, narrow to that region.
 Otherwise, narrow to the current function. If this has no effect,
 widen the buffer. You can add more functions to
 `recursive-narrow-dwim-functions'."
   (interactive)
-  (recursive-narrow-save-position
-   (cond ((region-active-p) (narrow-to-region (region-beginning) (region-end)))
-         ((run-hook-with-args-until-success 'recursive-narrow-dwim-functions))
-         ((derived-mode-p 'prog-mode) (narrow-to-defun))
-         ((derived-mode-p 'org-mode) (org-narrow-to-subtree)))
+  (cond ((region-active-p) (narrow-to-region (region-beginning) (region-end)))
+        ((run-hook-with-args-until-success 'recursive-narrow-dwim-functions))
+        ((derived-mode-p 'prog-mode) (narrow-to-defun))
+        ((derived-mode-p 'org-mode) (org-narrow-to-subtree)))
    ;; If we don't narrow
-   (progn
-     (message "Recursive settings: %d" (length recursive-narrow-settings))
-     (recursive-widen))))
+  (progn
+    (message "Recursive settings: %d" (length recursive-narrow-settings))
+    (widen)))
 
-(defun recursive-narrow-to-region (start end)
-  "Replacement of `narrow-to-region'.
-Performs the exact same function but also allows
-`recursive-widen' to remove just one call to
-`recursive-narrow-to-region'. START and END define the region."
-  (interactive "r")
-  (recursive-narrow-save-position (narrow-to-region start end)))
-
-(defun recursive-narrow-to-defun (&optional arg)
-  "Replacement of `narrow-to-defun'.
-Performs the exact same function but also allows
-`recursive-widen' to remove just one call to
-`recursive-narrow-to-region'. Optional ARG is ignored."
-  (interactive)
-  (recursive-narrow-save-position
-   (narrow-to-defun)))
-
-(defun recursive-widen ()
+(defun recursive-widen (func)
   "Replacement of widen that will only pop one level of visibility."
   (interactive)
   (let (widen-to)
     (if recursive-narrow-settings
         (progn
           (setq widen-to (pop recursive-narrow-settings))
-          (narrow-to-region (car widen-to) (cdr widen-to))
+          ;; shadow `recursive-narrow-settings' to avoid this call to
+          ;; `narrow-to-region' to push another narrowing setting
+          (let (recursive-narrow-settings)
+            (narrow-to-region (car widen-to) (cdr widen-to)))
           (recenter))
-      (widen))))
+      (funcall func))))
 
-
-(global-set-key (kbd "C-x n w") 'recursive-widen)
-(global-set-key (kbd "C-x n n") 'recursive-narrow-or-widen-dwim)
+;;;###autoload
+(define-minor-mode recursive-narrow-mode
+  "Make narrow and widen recursive, i.e. if there are multiple
+  calls to `narrow-to-region', then calling `widen' will bring
+  the previous buffer visibility"
+  :global t
+  (if recursive-narrow-mode
+      (progn
+        (advice-add #'widen :around #'recursive-widen)
+        (mapc
+         (lambda (func)
+           (advice-add func :around #'recursive-narrow-wrapper))
+         recursive-narrow-funcs-to-advise))
+    (advice-remove #'widen #'recursive-widen)
+    (mapc
+     (lambda (func)
+       (advice-remove func #'recursive-narrow-wrapper))
+     recursive-narrow-funcs-to-advise)))
 
 (provide 'recursive-narrow)
 
